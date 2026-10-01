@@ -1,0 +1,27 @@
+{
+  "name": "image-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "浏览器端高性能图片处理引擎（wasm-vips / libvips）：缩放 / 裁剪 / 旋转 / 格式转换，自包含可整包拷贝，图片零上传",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "demo": "node scripts/serve-demo.mjs",
+    "test": "node scripts/test-node.mjs",
+    "test:browser": "node scripts/test-browser.mjs"
+  },
+  "keywords": [
+    "image",
+    "wasm",
+    "libvips",
+    "wasm-vips",
+    "resize",
+    "crop",
+    "convert",
+    "webp",
+    "avif"
+  ]
+}

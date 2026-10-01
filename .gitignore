@@ -1,0 +1,13 @@
+# 构建产物（12MB，含 wasm 二进制，不入库；用 npm run build 生成）
+dist/
+
+# 拉取 wasm-vips 的缓存
+.cache/
+
+# 依赖（本仓库本身零依赖，只有测试/构建用的 node 内置模块）
+node_modules/
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+.DS_Store
