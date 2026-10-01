@@ -13,7 +13,7 @@
  *   - 打开 Target.setAutoAttach(flatten) 才能拿到 Worker 内部的异常；
  *   - 结果通过页面 console 回传，不走 Runtime.evaluate（后者在页面忙时会失联）。
  *
- * 用法：npm run test:browser
+ * 用法：pnpm test:browser
  *   CHROME_PATH          覆盖浏览器路径
  *   SMOKE_TIMEOUT_MS     单次用例超时，默认 90000
  *   SMOKE_WORKERS        强制 Worker 池大小（诊断用）
@@ -37,7 +37,7 @@ const TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS || 90000)
 const WORKERS = process.env.SMOKE_WORKERS
 
 if (!existsSync(path.join(ENGINE_DIR, 'index.js'))) {
-  console.error('✗ 找不到 dist/image-engine，请先执行：npm run build')
+  console.error('✗ 找不到 dist/image-engine，请先执行：pnpm build')
   process.exit(1)
 }
 if (!existsSync(CHROME)) {

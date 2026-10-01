@@ -5,7 +5,7 @@
  * 验证构建产物 dist/image-engine 能独立跑通：缩放 / 裁剪 / 旋转 / 换取格式 / 错误处理。
  * 源图由脚本自己用 zlib 现造一张 PNG，不依赖任何外部图片或第三方库。
  *
- * 用法：npm test（或 node scripts/test-node.mjs）
+ * 用法：pnpm test（或 node scripts/test-node.mjs）
  */
 
 import { existsSync } from 'node:fs'
@@ -45,7 +45,7 @@ async function checkThrows(name, fn, code) {
 /* ─────────────── 主流程 ─────────────── */
 
 if (!existsSync(ENTRY)) {
-  console.error(`✗ 找不到构建产物 ${ENTRY}\n  请先执行：npm run build`)
+  console.error(`✗ 找不到构建产物 ${ENTRY}\n  请先执行：pnpm build`)
   process.exit(1)
 }
 

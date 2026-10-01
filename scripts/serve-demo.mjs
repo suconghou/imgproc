@@ -5,7 +5,7 @@
  * 起一个带 COOP/COEP 响应头的静态服务，把 dist/image-engine 挂到 /engine/，
  * 再提供一个可直接操作的演示页面。用于拿到工具包后立刻验证效果。
  *
- * 用法：npm run demo（或 node scripts/serve-demo.mjs [端口]）
+ * 用法：pnpm demo（或 node scripts/serve-demo.mjs [端口]）
  */
 
 import http from 'node:http'
@@ -19,7 +19,7 @@ const ENGINE_DIR = path.join(ROOT, 'dist', 'image-engine')
 const PORT = Number(process.argv[2] || 8787)
 
 if (!existsSync(path.join(ENGINE_DIR, 'index.js'))) {
-  console.error('✗ 找不到 dist/image-engine，请先执行：npm run build')
+  console.error('✗ 找不到 dist/image-engine，请先执行：pnpm build')
   process.exit(1)
 }
 

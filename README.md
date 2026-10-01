@@ -363,7 +363,7 @@ export default defineConfig({
 
 ## 8. 目录结构
 
-### 分发产物（`npm run build` 生成，拷走的是这个）
+### 分发产物（`pnpm build` 生成，拷走的是这个）
 
 ```
 dist/image-engine/
@@ -414,30 +414,35 @@ imgproc/
 
 ## 9. 开发本仓库
 
-本仓库**零 npm 依赖**，只需要 Node ≥ 22（构建时从 registry 拉一次 wasm-vips，之后走 `.cache/`）。
+本仓库统一使用 **pnpm**（见 `packageManager` 字段），**零 npm 依赖**，只需要 Node ≥ 22
+（构建时从 registry 拉一次 wasm-vips，之后走 `.cache/`）。
 
 ```bash
-npm run build                # 产出 dist/image-engine/
-npm run build -- --copy-to ../toolsite/public/image-engine   # 顺手同步到消费方
-npm test                     # Node 回归（38 项断言）
-npm run test:browser         # 无头 Chrome 回归（需本机有 Chrome；沙箱内需 --no-sandbox，脚本已带）
-npm run demo                 # 起本地试用页 http://127.0.0.1:8787/
+pnpm build                                             # 产出 dist/image-engine/
+pnpm build -- --copy-to ../toolsite/public/image-engine # 顺手整包同步到消费方
+pnpm test                                              # Node 回归（38 项断言）
+pnpm test:browser                                      # 无头 Chrome 回归（需本机有 Chrome）
+pnpm demo                                              # 起本地试用页 http://127.0.0.1:8787/
 ```
 
 几点约定：
 
 - **`dist/` 不入库**（12MB，含第三方 wasm 二进制）。要给别人用就 `--copy-to` 到目标项目，
   或把产物打包成 Release 附件。
-- 升级 libvips：`WASM_VIPS_VERSION=0.0.20 npm run build`，构建脚本会去 registry 取新版本并重新解包。
-- 改完 `src/` 后**务必跑 `npm test` + `npm run test:browser`**：浏览器那条链路会抓出
+- 升级 libvips：`WASM_VIPS_VERSION=0.0.20 pnpm build`，构建脚本会去 registry 取新版本并重新解包。
+- 改完 `src/` 后**务必跑 `pnpm test` + `pnpm test:browser`**：浏览器那条链路会抓出
   Node 侧覆盖不到的问题（Worker 池、跨源隔离、资源按路径加载）。
 - 新增输出格式时，除了 `src/ops.js` 的 `SUFFIX_BY_FORMAT` / `buildSaveOptions`，
   记得同步 README 第 5 节与本文件第 3 节的选项表。
+- **消费方**：本站不消费，实际使用者是 toolsite 等站点。改完引擎后到消费方执行同步命令即可
+  （toolsite 里是 `pnpm engine:sync`），消费方只保留产物、不再保留源码副本。
 
 ---
 
 ## 10. 许可
 
-引擎基于 [libvips](https://www.libvips.org/) / [wasm-vips](https://github.com/kleisauke/wasm-vips)（MIT）。
-随包的 `LICENSE` 与 `THIRD-PARTY-NOTICES.md` 为 wasm-vips 及其依赖方的许可声明，请一并保留。
+本仓库**不声明自身许可**（未附 `LICENSE`）。
+产物里随包的 `LICENSE` 与 `THIRD-PARTY-NOTICES.md` 是 **wasm-vips 及其依赖方的**许可声明
+（MIT），属于分发捆绑二进制时必须保留的内容，请勿删除。
+
 

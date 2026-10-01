@@ -2,6 +2,7 @@
   "name": "image-engine",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.1.2",
   "description": "浏览器端高性能图片处理引擎（wasm-vips / libvips）：缩放 / 裁剪 / 旋转 / 格式转换，自包含可整包拷贝，图片零上传",
   "type": "module",
   "engines": {
