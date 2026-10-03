@@ -210,7 +210,80 @@ const ISOLATION_HEADERS = {
   'Cross-Origin-Embedder-Policy': 'require-corp',
 }
 
-function createServer(withIsolation) {
+// CDN 侧对工具包资源要放行的头，与 site-src/_headers 保持一致
+const CDN_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Cross-Origin-Resource-Policy': 'cross-origin',
+}
+
+/**
+ * 用例 C：消费方页面在源 A，工具包从源 B 跨源 <script src> 引入。
+ * 这是「部署到 CDN 给别的站点直接引用」的关键验证。
+ */
+const CROSS_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>engine cross-origin smoke</title></head>
+<body><div id="out">running</div>
+<script src="__CDN__/image-engine/image-engine.js"><\/script>
+<script>
+const checks = []
+const push = (name, ok, extra) => checks.push({ name, ok: !!ok, extra: extra === undefined ? '' : String(extra) })
+const done = (err) => console.log('ENGINE_RESULT:' + JSON.stringify(
+  err ? { ok: false, error: (err && err.stack) || String(err), checks } : { ok: checks.every((c) => c.ok), checks }))
+addEventListener('error', (e) => done(e.error || e.message))
+addEventListener('unhandledrejection', (e) => done(e.reason))
+
+// 注意：这里是经典 <script>，顶层 await 不合法，必须包一层 async IIFE
+;(async () => {
+try {
+  push('消费方页面已跨源隔离', globalThis.crossOriginIsolated === true, globalThis.crossOriginIsolated)
+
+  const engine = await ImageEngine.create()
+  push('跨源引用：引擎创建成功', true, engine.mode)
+  push('走的是 worker 池（跨源 Worker 已被包装）', engine.mode === 'worker', engine.mode)
+
+  const file = new File([await (await fetch('/test.png')).blob()], 'test.png', { type: 'image/png' })
+  const meta = await engine.metadata(file)
+  push('能读元信息', meta.width === 800 && meta.height === 600, meta.width + 'x' + meta.height)
+
+  const webp = await engine.convert(file, { format: 'webp', quality: 80 })
+  push('跨源引用下能正常转码', webp.size > 0 && webp.format === 'webp', webp.size + ' B / ' + webp.mime)
+
+  const avif = await engine.process(file, [{ op: 'resize', width: 200 }], { format: 'avif', quality: 50 })
+  push('跨源下 AVIF 动态模块可用', avif.size > 0 && avif.width === 200, avif.size + ' B')
+
+  engine.destroy()
+  done()
+} catch (err) { done(err) }
+})()
+document.getElementById('out').textContent = 'finished'
+<\/script></body></html>`
+
+/** 模拟 CDN：把编译产物挂在 /image-engine/ 下，并带上放行头 */
+function createCdnServer(engineDir) {
+  const MOUNT = '/image-engine/'
+  return http.createServer((req, res) => {
+    const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname)
+    if (!pathname.startsWith(MOUNT)) {
+      res.writeHead(404, CDN_HEADERS)
+      res.end('not found')
+      return
+    }
+    const full = path.join(engineDir, pathname.slice(MOUNT.length))
+    if (!full.startsWith(engineDir)) { res.writeHead(403, CDN_HEADERS); res.end(); return }
+    readFile(full)
+      .then((data) => {
+        res.writeHead(200, {
+          ...CDN_HEADERS,
+          'content-type': MIME[path.extname(full)] || 'application/octet-stream',
+          'content-length': data.length,
+        })
+        res.end(data)
+      })
+      .catch(() => { res.writeHead(404, CDN_HEADERS); res.end('not found: ' + pathname) })
+  })
+}
+
+function createServer(withIsolation, pageHtml = PAGE) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost')
     const pathname = decodeURIComponent(url.pathname)
@@ -219,7 +292,7 @@ function createServer(withIsolation) {
     if (pathname === '/favicon.ico') { res.writeHead(204, base); res.end(); return }
     if (pathname === '/' || pathname === '/index.html') {
       res.writeHead(200, { ...base, 'content-type': MIME['.html'] })
-      res.end(PAGE)
+      res.end(pageHtml)
       return
     }
     if (pathname === '/test.png') {
@@ -275,8 +348,13 @@ async function findBrowserWs(port) {
 
 /* ─────────────── 单个用例 ─────────────── */
 
-async function runCase({ iso }) {
-  const server = createServer(iso)
+async function runCase({ iso, crossOrigin = false }) {
+  // 用例 C：页面与工具包不同源（模拟从 CDN 引用）
+  const cdnServer = crossOrigin ? createCdnServer(ENGINE_DIR) : null
+  const cdnPort = cdnServer ? await listen(cdnServer) : 0
+  const pageHtml = crossOrigin ? CROSS_PAGE.replace('__CDN__', `http://127.0.0.1:${cdnPort}`) : PAGE
+
+  const server = createServer(iso, pageHtml)
   const httpPort = await listen(server)
   const cdpPort = await freePort()
   const profileDir = await mkdtemp(path.join(os.tmpdir(), 'engine-smoke-'))
@@ -402,6 +480,7 @@ async function runCase({ iso }) {
   } finally {
     try { chrome?.kill('SIGKILL') } catch { /* 忽略 */ }
     await new Promise((r) => server.close(r))
+    if (cdnServer) await new Promise((r) => cdnServer.close(r))
     await rm(profileDir, { recursive: true, force: true }).catch(() => {})
   }
 }
@@ -441,6 +520,7 @@ console.log('\nimage-engine 浏览器验证（无头 Chrome）')
 let failures = 0
 failures += report('用例 A：已配置 COOP/COEP（预期全链路可用）', await runCase({ iso: true }))
 failures += report('用例 B：未配置响应头（预期给出明确报错）', await runCase({ iso: false }))
+failures += report('用例 C：工具包跨源引用（页面在源 A、工具包在源 B）', await runCase({ iso: true, crossOrigin: true }))
 
 console.log(`\n${'─'.repeat(52)}`)
 if (failures) {

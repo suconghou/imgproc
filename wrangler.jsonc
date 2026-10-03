@@ -1,0 +1,14 @@
+{
+  // Cloudflare Workers 配置：只托管静态资源，不需要 Worker 脚本。
+  // 部署后得到 https://imgproc.<你的账号子域>.workers.dev/
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "imgproc",
+  // 新建时改成当天日期
+  "compatibility_date": "2026-10-03",
+  "assets": {
+    // 由 `pnpm build:site` 组装：index.html + _headers + image-engine/（编译好的工具包）
+    "directory": "./site"
+    // 没有 main → 纯静态资源 Worker；未命中的请求返回 404（符合 CDN 语义）
+    // _headers 里配了跨源隔离头与跨源引用放行头，见 site-src/_headers
+  }
+}

@@ -181,6 +181,11 @@ export interface EngineOptions {
   threads?: number
   /** 自定义 wasm 定位函数（仅直连模式生效） */
   locateFile?: (file: string, scriptDirectory: string) => string
+  /**
+   * 强制开启跨源加载兼容。默认自动判断：模块自身从别的源（CDN）加载时为 true。
+   * 用于胶水代码跨源时绕开 pthread 线程池的同源限制。
+   */
+  workaroundCors?: boolean
 }
 
 export interface ImageEngine {

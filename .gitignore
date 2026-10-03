@@ -1,5 +1,11 @@
-# 构建产物（12MB，含 wasm 二进制，不入库；用 npm run build 生成）
+# 构建产物（12MB，含 wasm 二进制，不入库；用 pnpm build 生成）
 dist/
+
+# 可部署目录（由 pnpm build:site 组装，同样不入库）
+site/
+
+# wrangler 本地状态
+.wrangler/
 
 # 拉取 wasm-vips 的缓存
 .cache/

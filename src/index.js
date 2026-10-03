@@ -92,6 +92,50 @@ function deserializeError(err) {
   return e
 }
 
+/* ─────────────────────────── 跨源（CDN）引用 ─────────────────────────── */
+
+/** 某个 URL 是否与当前页面不同源（Node / 无 location 时恒为 false） */
+function isCrossOrigin(url) {
+  if (typeof location === 'undefined') return false
+  try {
+    return new URL(url, location.href).origin !== location.origin
+  } catch {
+    return false
+  }
+}
+
+/** 本模块自身是否从别的源加载（例如被 CDN 上的 <script src> 引入） */
+const SELF_CROSS_ORIGIN = (() => {
+  try { return isCrossOrigin(import.meta.url) } catch { return false }
+})()
+
+/**
+ * 浏览器不允许 `new Worker(跨源 URL)`（会直接抛 SecurityError）。
+ * 跨源时改用「同源 blob Worker 静态 import 跨源 worker.js」：
+ * 这样 worker.js 内部的相对 import 依旧按它自己的 CDN 地址解析，
+ * 而 Worker 本身是同源的，绕开限制。
+ */
+async function resolveWorkerUrl(rawWorkerUrl) {
+  const abs = new URL(rawWorkerUrl, location.href).href
+  if (!isCrossOrigin(abs)) return { url: abs, crossOrigin: false }
+
+  let res
+  try {
+    res = await fetch(abs)
+  } catch (err) {
+    throw new EngineError(
+      `无法从 ${abs} 取回 worker.js：${err?.message || err}\n`
+      + '跨源引用时该地址必须带 Access-Control-Allow-Origin。',
+      'WORKER_ERROR',
+    )
+  }
+  if (!res.ok) throw new EngineError(`无法从 ${abs} 取回 worker.js：HTTP ${res.status}`, 'WORKER_ERROR')
+  await res.arrayBuffer() // 预检：读得到就说明 CORS 通了，避免后面只拿到一个含糊的 Worker 错误
+
+  const blob = new Blob([`import ${JSON.stringify(abs)};`], { type: 'text/javascript' })
+  return { url: URL.createObjectURL(blob), crossOrigin: true }
+}
+
 /* ─────────────────────────── API 组装 ─────────────────────────── */
 
 function buildApi({ mode, size, run, meta, destroy }) {
@@ -146,6 +190,7 @@ async function createDirectEngine(options, config) {
     wasmBase: config.wasmBase,
     locateFile: options.locateFile,
     threads: config.threads,
+    workaroundCors: config.workaroundCors,
   })
 
   let destroyed = false
@@ -237,7 +282,8 @@ function createSlot(workerUrl) {
 }
 
 async function createWorkerEngine(options, config) {
-  const workerUrl = options.workerUrl || new URL('./worker.js', import.meta.url)
+  // 跨源（CDN）引用时这里会返回一个同源的 blob Worker 地址
+  const { url: workerUrl, crossOrigin } = await resolveWorkerUrl(options.workerUrl || new URL('./worker.js', import.meta.url))
 
   const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 2
   const requested = Number(options.workers)
@@ -249,7 +295,16 @@ async function createWorkerEngine(options, config) {
   // 池里有多个 Worker 时，每个只用 1 个 libvips 线程 —— 否则会线程超订。
   // 只有 1 个 Worker 时，让它吃满所有核更划算。
   const threadsPerWorker = config.threads > 0 ? config.threads : size === 1 ? cores : 1
-  const initMessage = { type: 'init', config: { svg: config.svg, wasmBase: config.wasmBase, threads: threadsPerWorker } }
+  const initMessage = {
+    type: 'init',
+    config: {
+      svg: config.svg,
+      wasmBase: config.wasmBase,
+      threads: threadsPerWorker,
+      // 胶水代码从别的源加载时，它内部派生 pthread 线程池要绕同源限制
+      workaroundCors: config.workaroundCors || crossOrigin,
+    },
+  }
 
   const slots = []
   const waiters = []
@@ -393,6 +448,7 @@ async function createWorkerEngine(options, config) {
  * @param {boolean}[options.svg]         启用 SVG 输入（需 vips-resvg.wasm）
  * @param {number} [options.threads]     libvips 内部线程数
  * @param {Function}[options.locateFile] 自定义 wasm 定位（仅直连模式生效）
+ * @param {boolean}[options.workaroundCors] 强制开启跨源加载兼容（默认按模块自身来源自动判断）
  * @returns {Promise<object>} 引擎实例
  */
 export async function createImageEngine(options = {}) {
@@ -404,6 +460,8 @@ export async function createImageEngine(options = {}) {
     svg: options.svg === true,
     wasmBase: options.wasmBase || '',
     threads: Number.isFinite(options.threads) ? Number(options.threads) : 0,
+    // 本模块从 CDN 加载时，胶水代码也是跨源的，pthread 线程池需要绕同源限制
+    workaroundCors: options.workaroundCors === true || SELF_CROSS_ORIGIN,
   }
 
   const canUseWorker =

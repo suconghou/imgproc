@@ -57,6 +57,31 @@ await writeFile('out.webp', out.buffer)
 
 Node 环境没有 `Worker`，会自动退化为直连模式，API 完全一致。
 
+### 方式 D：从 CDN 跨源引用
+
+本仓库可以部署到 Cloudflare Workers（静态资源），把编译好的工具包当作 CDN 用，
+别的站点直接 `<script src>` 或 `import` 即可，不必把文件拷进自己项目：
+
+```html
+<script src="https://imgproc.<你的子域>.workers.dev/image-engine/image-engine.js"></script>
+<script>
+  ImageEngine.create().then(async (engine) => {
+    const out = await engine.convert(file, { format: 'webp', quality: 80 })
+  })
+</script>
+```
+
+> ⚠️ 消费方页面**仍然必须自己配 COOP/COEP**（见第 6 节）—— 跨源隔离是页面自身的属性，
+> CDN 的响应头帮不上忙。
+>
+> 浏览器的同源策略不允许 `new Worker(跨源URL)`。引擎检测到跨源会自动改用
+> 「同源 blob Worker 静态 import 那个跨源地址」的方式绕开，**调用方无需做任何事**；
+> 相关验证见 `scripts/test-browser.mjs` 的用例 C。
+>
+> 若你的站点有 CSP，需要放开 `worker-src blob:`。
+
+部署方式见第 10 节。
+
 ### 先在本地试一下
 
 因为必须带 COOP/COEP 响应头，**直接双击打开 `index.html`（file://）或普通静态服务器都不行**。
@@ -491,12 +516,17 @@ imgproc/
 │   ├── loader.js
 │   ├── ops.js
 │   └── index.d.ts
+├── site-src/          # 可部署站点的源文件（不是工具包的一部分）
+│   ├── index.html     # 落地页 + 在线试用，兼作跨源隔离配置的参考实现
+│   └── _headers       # Cloudflare 响应头规则
 ├── scripts/
-│   ├── build.mjs          # 构建：拷贝源码 + 拉取 wasm-vips + 生成 package.json/manifest.json
-│   ├── test-node.mjs      # Node 直连回归（38 项断言）
-│   ├── test-browser.mjs   # 无头 Chrome + CDP 回归（有/无 COOP-COEP 两条路径）
-│   ├── serve-demo.mjs     # 本地试用页
+│   ├── build.mjs          # 构建工具包：拷贝源码 + 拉取 wasm-vips + 生成 package.json/manifest.json
+│   ├── build-site.mjs     # 组装 site/（落地页 + _headers + 工具包）
+│   ├── test-node.mjs      # Node 直连回归（60 项断言）
+│   ├── test-browser.mjs   # 无头 Chrome + CDP 回归（同源 / 无隔离头 / 跨源引用 三条路径）
+│   ├── serve-demo.mjs     # 本地预览 site/，按 _headers 套响应头
 │   └── lib/make-png.mjs   # 测试用：纯 Node 造 PNG
+├── wrangler.jsonc     # Cloudflare Workers 配置（纯静态资源）
 ├── README.md          # 本文件（唯一来源，构建时一并拷进产物）
 └── package.json
 ```
@@ -509,11 +539,13 @@ imgproc/
 （构建时从 registry 拉一次 wasm-vips，之后走 `.cache/`）。
 
 ```bash
-pnpm build                                             # 产出 dist/image-engine/
+pnpm build                                             # 产出 dist/image-engine/（工具包）
+pnpm build:site                                        # 再组装出 site/（可部署目录）
 pnpm build -- --copy-to ../toolsite/public/image-engine # 顺手整包同步到消费方
-pnpm test                                              # Node 回归（38 项断言）
-pnpm test:browser                                      # 无头 Chrome 回归（需本机有 Chrome）
-pnpm demo                                              # 起本地试用页 http://127.0.0.1:8787/
+pnpm test                                              # Node 回归（60 项断言）
+pnpm test:browser                                      # 无头 Chrome 回归（同源 / 无隔离头 / 跨源引用）
+pnpm demo                                              # 本地预览 site/ http://127.0.0.1:8787/
+pnpm cf:deploy                                         # 部署到 Cloudflare（= npx wrangler deploy）
 ```
 
 几点约定：
@@ -530,7 +562,111 @@ pnpm demo                                              # 起本地试用页 http
 
 ---
 
-## 10. 许可
+## 10. 部署到 Cloudflare（当 CDN 用）
+
+部署的是**编译产物本身**（不是某个站点）：`site/` 目录里是 `image-engine/`（完整工具包）
+加一个落地页与 `_headers`。别的站点可以直接引用它。
+
+### 10.1 产物结构
+
+```
+site/                      ← wrangler 的 assets.directory
+├── index.html             落地页（同时是跨源隔离配置的参考实现）
+├── _headers               Cloudflare 响应头规则
+└── image-engine/          编译好的工具包（dist/image-engine 的副本）
+```
+
+组装：`pnpm build:site`（内部会先跑一次 `pnpm build`）。`site/` 不入库。
+
+### 10.2 wrangler.jsonc
+
+仓库根目录已带好，是个**纯静态资源 Worker，没有 Worker 脚本**：
+
+```jsonc
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "imgproc",
+  "compatibility_date": "2026-10-03",
+  "assets": { "directory": "./site" }
+}
+```
+
+改 `name` 会决定域名前缀：`https://<name>.<你的账号子域>.workers.dev/`。
+
+### 10.3 在 Cloudflare 面板里连仓库
+
+**Workers & Pages → Create → Workers → Connect to Git**，选中 `suconghou/imgproc`，然后按下表填：
+
+| 设置项 | 填什么 | 说明 |
+|---|---|---|
+| Git branch | `master` | 本仓库的生产分支 |
+| Root directory | `/` | package.json 就在根目录 |
+| **Build command** | `pnpm build:site` | 组装 `site/`；Cloudflare 会自动先装依赖 |
+| **Deploy command** | `npx wrangler deploy` | Cloudflare 的默认值，不用改 |
+| Non-production deploy command | `npx wrangler versions upload` | 默认值，分支构建时产出预览版本而不上生产 |
+| Build variables | 不需要 | 无密钥、无环境变量 |
+
+> 若想显式装依赖，Build command 可用 `pnpm install && pnpm build:site`。
+> **不要把 Deploy command 写成 `pnpm deploy`** —— 那是 pnpm 自己的 workspace 命令，会冲突；
+> 要跑脚本请写 `pnpm run cf:deploy`。
+
+首次部署一般 1–2 分钟（要上传 12MB 资源）。之后每次 push 到 `master` 自动重建。
+
+### 10.4 `_headers`（我已经配好并提交）
+
+`site-src/_headers` 会随 `build:site` 拷进产物，Cloudflare 会解析它、并把规则套到静态资源响应上：
+
+```
+# 演示页需要跨源隔离
+/
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/index.html
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/*
+  X-Content-Type-Options: nosniff
+
+# 工具包：允许别的站点跨源引用
+/image-engine/*
+  Access-Control-Allow-Origin: *
+  Cross-Origin-Resource-Policy: cross-origin
+
+# wasm 与胶水代码长缓存
+/image-engine/vendor/*
+  Cache-Control: public, max-age=31536000, immutable
+```
+
+两个放行头的分工（缺一不可）：
+
+- `Access-Control-Allow-Origin: *` → 模块 `import` / `fetch` 走 CORS 模式时需要
+- `Cross-Origin-Resource-Policy: cross-origin` → 消费方页面带 `COEP: require-corp` 时，
+  经典 `<script src>` 才能通过检查
+
+`.wasm` 的 `Content-Type: application/wasm` 由 wrangler 按扩展名自动设置，不用手写。
+
+### 10.5 本地预览部署形态
+
+```bash
+pnpm demo          # 服务 site/，并按 site/_headers 逐条套响应头
+```
+
+本地看到的行为和线上一致（含跨源隔离与放行头），所以「本地能跑、线上不能」这类问题能提前发现。
+`site/` 不存在时它会自动先组装一次。
+
+### 10.6 本地手动部署（可选）
+
+```bash
+npx wrangler login     # 一次性授权
+pnpm cf:deploy         # = npx wrangler deploy
+npx wrangler deploy --dry-run   # 只校验配置与资源清单，不上传
+```
+
+---
+
+## 11. 许可
 
 本仓库**不声明自身许可**（未附 `LICENSE`）。
 产物里随包的 `LICENSE` 与 `THIRD-PARTY-NOTICES.md` 是 **wasm-vips 及其依赖方的**许可声明

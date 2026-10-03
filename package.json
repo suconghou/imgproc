@@ -10,7 +10,9 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:site": "pnpm build && node scripts/build-site.mjs",
     "demo": "node scripts/serve-demo.mjs",
+    "cf:deploy": "npx wrangler deploy",
     "test": "node scripts/test-node.mjs",
     "test:browser": "node scripts/test-browser.mjs"
   },

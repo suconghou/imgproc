@@ -57,6 +57,7 @@ const DEFAULT_DYNAMIC_LIBRARIES = ['vips-jxl.wasm', 'vips-heif.wasm']
  * @param {boolean} [config.svg]         是否启用 SVG 输入（需 vips-resvg.wasm）
  * @param {Function}[config.locateFile]  自定义定位函数 (file, scriptDirectory) => url（仅直连模式生效）
  * @param {number}  [config.threads]     libvips 内部线程数
+ * @param {boolean} [config.workaroundCors] 胶水代码本身是跨源加载时置 true
  * @param {Array}   [config.dynamicLibraries] 完全自定义动态模块列表（高级）
  * @returns {Promise<object>} 已初始化的 vips 模块
  */
@@ -72,6 +73,10 @@ export async function loadVips(config = {}) {
   }
 
   const options = { dynamicLibraries }
+
+  // 胶水代码从别的源加载时，它内部派生 pthread 线程池的 Worker 会被同源策略挡下；
+  // 打开这个开关，emscripten 会改用 blob 包一层再加载，从而拿到正确的 base URL。
+  if (config.workaroundCors === true) options.workaroundCors = true
 
   const locator = typeof config.locateFile === 'function'
     ? config.locateFile
