@@ -50,16 +50,37 @@ function toTransferable(bytes) {
 function normalizeResult(payload) {
   const buffer = new Uint8Array(payload.buffer)
   const mime = payload.mime || MIME_BY_FORMAT[payload.format] || 'application/octet-stream'
+  const frames = payload.frames ?? 1
   return {
     buffer,
     blob: typeof Blob !== 'undefined' ? new Blob([buffer], { type: mime }) : null,
     width: payload.width,
     height: payload.height,
+    /** 单帧高度；多帧时 height 是所有帧拼起来的总高度 */
+    frameHeight: payload.frameHeight ?? payload.height,
+    /** 帧数；> 1 表示动图 */
+    frames,
+    animated: frames > 1,
+    /** 实际使用的 quality；webp 走 targetSize 时为 null（Q 被忽略），未指定时为 undefined */
+    quality: payload.quality,
     size: buffer.byteLength,
     format: payload.format,
     mime,
     type: mime,
   }
+}
+
+/**
+ * 去掉 output 里不能跨线程传递的成员（函数）。
+ * onProgress 只在主线程持有，靠任务 id 把 Worker 的进度消息路由回来。
+ */
+function stripControl(output) {
+  if (!output || typeof output !== 'object') return {}
+  const clean = {}
+  for (const [k, v] of Object.entries(output)) {
+    if (typeof v !== 'function') clean[k] = v
+  }
+  return clean
 }
 
 /** 还原 Worker 侧序列化过来的错误 */
@@ -83,26 +104,27 @@ function buildApi({ mode, size, run, meta, destroy }) {
     /**
      * 核心方法：按 ops 依次处理，再按 output 编码。
      * @param {File|Blob|ArrayBuffer|Uint8Array} source
-     * @param {Array} ops      操作列表
-     * @param {object} output  输出选项
+     * @param {Array} ops         操作列表
+     * @param {object} output     输出选项（format / quality / targetSize / animated / background / onProgress …）
+     * @param {object} [control]  { signal } —— AbortSignal，用于中途取消
      */
-    process(source, ops, output) {
-      return run(source, ops, output)
+    process(source, ops, output, control) {
+      return run(source, ops, output, control)
     },
 
     /** 语法糖：只缩放 */
-    resize(source, options = {}) {
-      return run(source, [{ op: 'resize', ...options }], options.output || {})
+    resize(source, { output, control, ...op } = {}) {
+      return run(source, [{ op: 'resize', ...op }], output || {}, control)
     },
 
     /** 语法糖：只裁剪 */
-    crop(source, options = {}) {
-      return run(source, [{ op: 'crop', ...options }], options.output || {})
+    crop(source, { output, control, ...op } = {}) {
+      return run(source, [{ op: 'crop', ...op }], output || {}, control)
     },
 
     /** 语法糖：只转格式（不改尺寸） */
-    convert(source, output = {}) {
-      return run(source, [], output)
+    convert(source, output = {}, control) {
+      return run(source, [], output, control)
     },
 
     /** 读取元信息（不解码像素） */
@@ -134,10 +156,15 @@ async function createDirectEngine(options, config) {
   const api = buildApi({
     mode: 'direct',
     size: 1,
-    async run(source, ops, output) {
+    async run(source, ops, output, control) {
       assertAlive()
+      const signal = control?.signal
+      if (signal?.aborted) throw new EngineError('已取消', 'ABORTED')
       const bytes = await toBytes(source)
-      return normalizeResult(runPipeline(vips, bytes, ops, output))
+      if (signal?.aborted) throw new EngineError('已取消', 'ABORTED')
+      // 直连模式下 runPipeline 是同步的，中途无法被打断，
+      // signal 只能在此处（开始前）生效。
+      return normalizeResult(runPipeline(vips, bytes, ops, output, { onProgress: output?.onProgress }))
     },
     async meta(source) {
       assertAlive()
@@ -161,19 +188,26 @@ function createSlot(workerUrl) {
 
   const slot = {
     busy: false,
+    dead: false,
     worker,
 
-    call(message, transfer) {
+    /**
+     * @param {object} message 发给 Worker 的消息（自动补 id）
+     * @param {object} [options] { transfer, onProgress }
+     */
+    call(message, options = {}) {
       const id = ++seq
       return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject })
-        worker.postMessage({ ...message, id }, transfer || [])
+        pending.set(id, { resolve, reject, onProgress: options.onProgress })
+        worker.postMessage({ ...message, id }, options.transfer || [])
       })
     },
 
-    terminate() {
+    terminate(reason) {
+      slot.dead = true
       worker.terminate()
-      for (const entry of pending.values()) entry.reject(new EngineError('引擎已销毁', 'DESTROYED'))
+      const err = reason || new EngineError('引擎已销毁', 'DESTROYED')
+      for (const entry of pending.values()) entry.reject(err)
       pending.clear()
     },
   }
@@ -183,6 +217,11 @@ function createSlot(workerUrl) {
     if (!msg || !msg.id) return
     const entry = pending.get(msg.id)
     if (!entry) return
+    // 进度是「进行中」的通知，不能因此结束该任务的等待
+    if (msg.type === 'progress') {
+      try { entry.onProgress?.(msg.percent) } catch { /* 调用方回调抛错不影响任务 */ }
+      return
+    }
     pending.delete(msg.id)
     if (typeof msg.type === 'string' && msg.type.endsWith('error')) entry.reject(deserializeError(msg.error))
     else entry.resolve(msg)
@@ -210,50 +249,113 @@ async function createWorkerEngine(options, config) {
   // 池里有多个 Worker 时，每个只用 1 个 libvips 线程 —— 否则会线程超订。
   // 只有 1 个 Worker 时，让它吃满所有核更划算。
   const threadsPerWorker = config.threads > 0 ? config.threads : size === 1 ? cores : 1
+  const initMessage = { type: 'init', config: { svg: config.svg, wasmBase: config.wasmBase, threads: threadsPerWorker } }
 
-  const slots = Array.from({ length: size }, () => createSlot(workerUrl))
+  const slots = []
   const waiters = []
   let destroyed = false
 
-  function acquire() {
-    if (destroyed) return Promise.reject(new EngineError('引擎已销毁，请重新 createImageEngine()', 'DESTROYED'))
+  /** 起一个 Worker 并等它把 vips 初始化好 */
+  async function spawnSlot() {
+    const slot = createSlot(workerUrl)
+    try {
+      await slot.call(initMessage)
+    } catch (err) {
+      slot.terminate(err)
+      throw err
+    }
+    return slot
+  }
+
+  async function acquire() {
+    if (destroyed) throw new EngineError('引擎已销毁，请重新 createImageEngine()', 'DESTROYED')
+    // 池被取消操作掏空时按需补一个，避免永远等不到名额
+    if (slots.length === 0) {
+      const fresh = await spawnSlot()
+      fresh.busy = true
+      slots.push(fresh)
+      return fresh
+    }
     const free = slots.find((s) => !s.busy)
     if (free) {
       free.busy = true
-      return Promise.resolve(free)
+      return free
     }
     return new Promise((resolve, reject) => waiters.push({ resolve, reject }))
   }
 
   function release(slot) {
+    if (slot.dead || destroyed) return
     const next = waiters.shift()
     if (next) next.resolve(slot) // 名额直接转交给下一个等待者，slot 保持 busy
     else slot.busy = false
   }
 
-  const initMessage = { type: 'init', config: { svg: config.svg, wasmBase: config.wasmBase, threads: threadsPerWorker } }
+  /**
+   * 取消一个正在跑的任务：Worker 里是同步的 WASM 求值，
+   * 发消息进去也不会被处理，所以只能终止它、再用一个新 Worker 补位。
+   */
+  function recycleSlot(slot, reason) {
+    const i = slots.indexOf(slot)
+    if (i >= 0) slots.splice(i, 1)
+    slot.terminate(reason)
+    if (destroyed) return
+    spawnSlot()
+      .then((fresh) => {
+        const w = waiters.shift()
+        if (w) {
+          fresh.busy = true
+          w.resolve(fresh)
+        }
+        slots.push(fresh)
+      })
+      .catch((err) => {
+        // 补位失败：把错误交给一个等待者，避免它永远挂着
+        const w = waiters.shift()
+        if (w) w.reject(err)
+      })
+  }
 
   try {
-    await Promise.all(slots.map((slot) => slot.call(initMessage)))
+    slots.push(...(await Promise.all(Array.from({ length: size }, () => spawnSlot()))))
   } catch (err) {
-    slots.forEach((s) => s.terminate())
+    slots.forEach((s) => s.terminate(err))
     throw err
   }
 
   const api = buildApi({
     mode: 'worker',
     size,
-    async run(source, ops, output) {
+    async run(source, ops, output, control) {
+      const signal = control?.signal
+      if (signal?.aborted) throw new EngineError('已取消', 'ABORTED')
+
       const bytes = await toBytes(source)
       const slot = await acquire()
+      let aborted = false
+
+      const onAbort = () => {
+        aborted = true
+        recycleSlot(slot, new EngineError('已取消', 'ABORTED'))
+      }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true })
+
       try {
+        if (signal?.aborted) throw new EngineError('已取消', 'ABORTED')
         const msg = await slot.call(
-          { type: 'run', input: toTransferable(bytes), ops: ops || [], output: output || {} },
-          undefined,
+          {
+            type: 'run',
+            input: toTransferable(bytes),
+            ops: ops || [],
+            // 函数不能结构化克隆，onProgress 留在主线程，靠 msg.id 路由回来
+            output: stripControl(output),
+          },
+          { onProgress: typeof output?.onProgress === 'function' ? output.onProgress : undefined },
         )
         return normalizeResult(msg)
       } finally {
-        release(slot)
+        if (signal) signal.removeEventListener('abort', onAbort)
+        if (!aborted) release(slot)
       }
     },
     async meta(source) {

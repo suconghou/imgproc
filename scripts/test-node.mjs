@@ -206,7 +206,148 @@ console.log('\n输入形态')
   check('带偏移的子视图输入', fromSub.width === SRC_W && fromSub.height === SRC_H, JSON.stringify(fromSub))
 }
 
-/* 10. 销毁 */
+/* 10. 透明合成（#1） */
+// 用 vendor 里的 vips 现造 RGBA 输入并回读像素（仅测试用）
+const vips = await (await import(path.join(ROOT, 'dist', 'image-engine', 'vendor', 'vips-node.mjs'))).default()
+
+/** 造一张 RGBA PNG：RGB 恒为红，alpha 按列分档 0 / 128 / 255 */
+function makeRgbaPng(width, height) {
+  const alphas = Array.from({ length: width }, (_, x) =>
+    x < width / 3 ? 0 : x < (width * 2) / 3 ? 128 : 255)
+  const data = new Uint8Array(width * height * 4)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4
+      data[i] = 255; data[i + 1] = 0; data[i + 2] = 0; data[i + 3] = alphas[x]
+    }
+  }
+  return new Uint8Array(vips.Image.newFromMemory(data, width, height, 4, 'uchar').writeToBuffer('.png'))
+}
+
+/** 回读多帧信息：必须用 n=-1，否则只能看到第一帧 */
+function inspect(buf) {
+  const im = vips.Image.newFromBuffer(new Uint8Array(buf), 'n=-1')
+  const ph = im.pageHeight > 0 ? im.pageHeight : im.height
+  return { pages: Math.max(1, Math.round(im.height / ph)), pageHeight: ph, width: im.width, height: im.height }
+}
+
+const rgbaPng = makeRgbaPng(6, 2)
+const rgbaMeta = await engine.metadata(rgbaPng)
+
+console.log('\n透明合成')
+{
+  check('RGBA 输入被识别为带 alpha', rgbaMeta.hasAlpha === true, `hasAlpha=${rgbaMeta.hasAlpha}`)
+
+  const out = await engine.convert(rgbaPng, { format: 'jpeg', quality: 95 })
+  const px = vips.Image.newFromBuffer(new Uint8Array(out.buffer)).getpoint(0, 0)
+  check('转 JPEG 时透明区自动合成白底（不再是黑底）', px[0] > 240 && px[1] > 240 && px[2] > 240, `[${px.join(', ')}]`)
+
+  const dark = await engine.convert(rgbaPng, { format: 'jpeg', quality: 95, background: '#000000' })
+  const pxDark = vips.Image.newFromBuffer(new Uint8Array(dark.buffer)).getpoint(0, 0)
+  check('background 可指定背景色', pxDark[0] < 15 && pxDark[1] < 15, `[${pxDark.join(', ')}]`)
+
+  const green = await engine.process(rgbaPng, [{ op: 'flatten', background: '#00ff00' }], { format: 'png' })
+  const backGreen = vips.Image.newFromBuffer(new Uint8Array(green.buffer))
+  check('flatten 操作可用（合成绿底并去掉 alpha）',
+    backGreen.bands === 3 && backGreen.getpoint(0, 0)[1] > 240,
+    `bands=${backGreen.bands} [${backGreen.getpoint(0, 0).join(', ')}]`)
+
+  const off = await engine.convert(rgbaPng, { format: 'jpeg', quality: 95, flatten: false })
+  const pxOff = vips.Image.newFromBuffer(new Uint8Array(off.buffer)).getpoint(0, 0)
+  check('flatten:false 可退回旧行为', pxOff[0] < 15, `[${pxOff.join(', ')}]`)
+}
+
+/* 11. 目标体积（#2） */
+console.log('\n目标体积')
+{
+  const target = 20 * 1024
+  const webp = await engine.convert(source, { format: 'webp', targetSize: target })
+  check('webp 走原生 target_size 命中', webp.size <= target,
+    `${(webp.size / 1024).toFixed(1)} KB ≤ 20 KB`)
+
+  const jpeg = await engine.convert(source, { format: 'jpeg', targetSize: '15kb' })
+  check("jpeg 二分逼近命中（'15kb' 字符串）", jpeg.size <= 15 * 1024,
+    `${(jpeg.size / 1024).toFixed(1)} KB ≤ 15 KB, quality=${jpeg.quality}`)
+
+  const avif = await engine.convert(source, { format: 'avif', targetSize: 12 * 1024 })
+  check('avif 二分逼近命中', avif.size <= 12 * 1024, `${(avif.size / 1024).toFixed(1)} KB`)
+
+  const qualityMode = await engine.convert(source, { format: 'jpeg', quality: 82 })
+  check('不传 targetSize 时 quality 仍生效', qualityMode.size > 0 && qualityMode.quality === 82)
+
+  await checkThrows('无损格式要求 targetSize 时给明确报错',
+    () => engine.convert(source, { format: 'png', targetSize: 4096 }), 'UNSUPPORTED_OPTION')
+}
+
+/* 12. 动图保留（#5） */
+console.log('\n动图')
+{
+  // 造一张 2 帧 GIF：两帧竖着拼起来，用 page_height 切分
+  const FW = 32
+  const FH = 24
+  const raw = new Uint8Array(FW * FH * 2 * 3)
+  for (let f = 0; f < 2; f++) {
+    for (let i = 0; i < FW * FH; i++) {
+      const o = (f * FW * FH + i) * 3
+      raw[o] = f === 0 ? 255 : 0
+      raw[o + 1] = f === 0 ? 0 : 255
+    }
+  }
+  const animGif = new Uint8Array(
+    vips.Image.newFromMemory(raw, FW, FH * 2, 3, 'uchar').writeToBuffer('.gif', { page_height: FH }))
+
+  const animMeta = await engine.metadata(animGif)
+  check('元信息能读出真实帧数', animMeta.pages === 2 && animMeta.animated === true,
+    `pages=${animMeta.pages} frameHeight=${animMeta.frameHeight}`)
+
+  const off = await engine.convert(animGif, { format: 'webp', quality: 80 })
+  check('默认只取第一帧', off.frames === 1 && off.animated === false, `frames=${off.frames}`)
+
+  const on = await engine.convert(animGif, { format: 'webp', quality: 80, animated: true })
+  check('animated:true 转 webp 保留 2 帧', on.frames === 2 && inspect(on.buffer).pages === 2,
+    `frames=${on.frames} 回读=${inspect(on.buffer).pages}`)
+
+  const resized = await engine.process(animGif, [{ op: 'resize', width: 16 }], { format: 'gif', animated: true })
+  const rb = inspect(resized.buffer)
+  check('动图 + resize 保持多帧与 page-height', resized.frames === 2 && rb.pages === 2 && resized.width === 16,
+    `frames=${resized.frames} ${resized.width}x${resized.height} pageH=${rb.pageHeight}`)
+
+  await checkThrows('动图 + 裁剪给明确报错',
+    () => engine.process(animGif, [{ op: 'crop', left: 0, top: 0, width: 8, height: 8 }], { format: 'gif', animated: true }),
+    'UNSUPPORTED_OPTION')
+  await checkThrows('动图输出到 jpeg 给明确报错',
+    () => engine.convert(animGif, { format: 'jpeg', animated: true }), 'UNSUPPORTED_OPTION')
+}
+
+/* 13. 进度回调（#3，直连模式） */
+console.log('\n进度回调')
+{
+  const seen = []
+  const out = await engine.process(source, [{ op: 'resize', width: 400 }], {
+    format: 'jpeg',
+    quality: 80,
+    onProgress: (p) => seen.push(p),
+  })
+  check('onProgress 被回调到', seen.length > 0, `收到 ${seen.length} 次`)
+  check('进度值都落在 0-100', seen.every((p) => p >= 0 && p <= 100), JSON.stringify(seen.slice(0, 6)))
+  check('最后一次进度是 100', seen[seen.length - 1] === 100, `最后 ${seen[seen.length - 1]}`)
+  check('进度不影响结果', out.size > 0 && out.format === 'jpeg')
+}
+
+/* 14. 取消（#4，直连模式的信号前置检查） */
+console.log('\n取消')
+{
+  const ac = new AbortController()
+  ac.abort()
+  await checkThrows('已取消的 signal 会立即拒绝',
+    () => engine.process(source, [], { format: 'png' }, { signal: ac.signal }), 'ABORTED')
+
+  const ok2 = new AbortController()
+  const out = await engine.process(source, [], { format: 'png' }, { signal: ok2.signal })
+  check('未取消的 signal 不影响处理', out.size > 0)
+}
+
+/* 15. 销毁 */
 console.log('\n销毁')
 {
   engine.destroy()

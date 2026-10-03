@@ -53,7 +53,11 @@ self.onmessage = async (event) => {
       case 'run': {
         if (!vips) await init(msg.config || {})
         const input = new Uint8Array(msg.input)
-        const out = runPipeline(vips, input, msg.ops, msg.output)
+        // 进度只在「求值过程中」产生，用独立消息回传；主线程按 id 路由到调用方的 onProgress。
+        // 取消不靠消息：这里是同步的 WASM 求值，收不到新消息，由主线程终止本 Worker 来实现。
+        const out = runPipeline(vips, input, msg.ops, msg.output, {
+          onProgress: (percent) => self.postMessage({ type: 'progress', id: msg.id, percent }),
+        })
         // 零拷贝回传：out.buffer 已是独立内存，直接把 ArrayBuffer 交出去
         self.postMessage(
           {

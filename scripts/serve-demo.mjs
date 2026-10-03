@@ -120,6 +120,18 @@ const DEMO = `<!doctype html>
         <label>最大宽度 px（留空则不缩放）</label>
         <input type="number" id="maxWidth" placeholder="例如 1600" min="1">
       </div>
+      <div>
+        <label>目标体积（留空则用质量滑块；webp/jpeg/avif/jxl）</label>
+        <input type="text" id="targetSize" placeholder="例如 200kb">
+      </div>
+      <div>
+        <label>透明背景色（目标格式不支持 alpha 时生效）</label>
+        <div class="row"><input type="color" id="background" value="#ffffff" style="width:56px;height:36px;padding:2px"><span class="note">转 JPEG 时合成到此色</span></div>
+      </div>
+      <div>
+        <label>动图</label>
+        <div class="row"><input type="checkbox" id="animated" style="width:16px;height:16px"><span class="note">保留多帧（仅 gif / webp / avif，且只能缩放）</span></div>
+      </div>
     </div>
     <div class="note" id="status">引擎加载中…</div>
   </div>
@@ -175,6 +187,11 @@ async function run(files) {
       const format = document.getElementById('format').value
       if (format) output.format = format
       output.quality = Number(qualityEl.value)
+      output.background = document.getElementById('background').value
+      const target = document.getElementById('targetSize').value.trim()
+      if (target) output.targetSize = target
+      if (document.getElementById('animated').checked) output.animated = true
+      output.onProgress = (p) => { row.querySelector('.meta').textContent = '处理中… ' + p + '%' }
 
       const t0 = performance.now()
       const out = await engine.process(file, ops, output)
@@ -186,9 +203,11 @@ async function run(files) {
       const pct = ((delta / file.size) * 100).toFixed(1)
       row.querySelector('.meta').innerHTML =
         file.name.split('.').pop().toUpperCase() + ' → ' + out.format.toUpperCase() + ' · ' +
-        out.width + '×' + out.height + '<br>' +
+        out.width + '×' + out.height +
+        (out.animated ? '（' + out.frames + ' 帧）' : '') + '<br>' +
         fmt(file.size) + ' → ' + fmt(out.size) + ' · ' +
         (delta < 0 ? '<span class="save">省 ' + Math.abs(pct) + '%</span>' : '<span class="grow">增 ' + pct + '%</span>') +
+        (target && out.quality ? ' · q' + out.quality : '') +
         ' · ' + ms + 'ms'
       row.querySelector('.act').innerHTML =
         '<a class="dl" download="' + file.name.replace(/\\.[^.]+$/, '') + '.' + out.format + '" href="' + url + '">下载</a>'

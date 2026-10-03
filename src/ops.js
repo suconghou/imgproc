@@ -95,6 +95,59 @@ const clampInt = (v, lo, hi, dflt) => {
   return Math.min(hi, Math.max(lo, Math.round(n)))
 }
 
+/** 不含 alpha 通道的输出格式：存这些格式前必须先把透明区合成到背景色 */
+const FORMATS_WITHOUT_ALPHA = new Set(['jpeg'])
+
+/** 支持多帧（动图）输出的格式 */
+const ANIMATED_FORMATS = new Set(['gif', 'webp', 'avif'])
+
+/** 可以用「二分 quality」逼近目标体积的有损格式（webp 走原生 target_size，不在此列） */
+const BISECT_FORMATS = new Set(['jpeg', 'avif', 'jxl'])
+
+/** 图像是否带 alpha（2=灰度+alpha，4=RGBA） */
+const hasAlphaBands = (img) => img.bands === 2 || img.bands === 4
+
+/**
+ * 解析背景色：'#rgb' / '#rrggbb' / 'white' 等 CSS 色名 / [r,g,b] → [r,g,b]（0-255）
+ */
+const NAMED_COLORS = { white: [255, 255, 255], black: [0, 0, 0] }
+export function parseColor(value) {
+  if (Array.isArray(value) && value.length >= 3) {
+    return [clampInt(value[0], 0, 255, 255), clampInt(value[1], 0, 255, 255), clampInt(value[2], 0, 255, 255)]
+  }
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase()
+    if (NAMED_COLORS[s]) return NAMED_COLORS[s]
+    const hex = s.startsWith('#') ? s.slice(1) : s
+    if (/^[0-9a-f]{3}$/.test(hex)) {
+      return [parseInt(hex[0] + hex[0], 16), parseInt(hex[1] + hex[1], 16), parseInt(hex[2] + hex[2], 16)]
+    }
+    if (/^[0-9a-f]{6}$/.test(hex)) {
+      return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)]
+    }
+  }
+  return NAMED_COLORS.white
+}
+
+/** flatten 的背景值长度必须与「图像波段数 - 1」一致：RGBA 给 3 个，灰度+alpha 给 1 个 */
+const backgroundFor = (bands, rgb) => (bands === 2 ? [rgb[0]] : rgb)
+
+/**
+ * 解析目标体积：数字（字节），或 '200kb' / '1.5mb' / '80KB' 这类字符串
+ */
+export function parseByteSize(value) {
+  if (value == null || value === '') return 0
+  if (typeof value === 'number') return value > 0 ? Math.round(value) : 0
+  const m = String(value).trim().toLowerCase().match(/^([\d.]+)\s*(b|kb|k|mb|m)?$/)
+  if (!m) return 0
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n <= 0) return 0
+  const unit = m[2] || 'b'
+  const factor = unit === 'mb' || unit === 'm' ? 1024 * 1024 : unit === 'b' ? 1 : 1024
+  return Math.round(n * factor)
+}
+
+
 /** 构建某个输出格式对应的 libvips 保存选项 */
 export function buildSaveOptions(format, output = {}) {
   const q = output.quality
@@ -124,14 +177,22 @@ export function buildSaveOptions(format, output = {}) {
       }
       break
 
-    case 'webp':
+    case 'webp': {
+      const target = parseByteSize(output.targetSize)
       Object.assign(opts, {
-        Q: clampInt(q, 1, 100, 80),
         lossless: output.lossless === true,
         effort: clampInt(output.effort, 0, 6, 4),
         keep,
       })
+      if (target > 0 && output.lossless !== true) {
+        // libwebp 原生支持按目标体积编码，最精确也最快（此时 Q 会被忽略）
+        opts.target_size = target
+        opts.passes = clampInt(output.passes, 1, 10, 6)
+      } else {
+        opts.Q = clampInt(q, 1, 100, 80)
+      }
       break
+    }
 
     case 'avif':
       Object.assign(opts, {
@@ -259,8 +320,18 @@ function applyStep(img, step) {
     case 'flop':
       return img.flipHor()
 
+    // 把透明区合成到指定背景色（无色可合则原样返回）
+    case 'flatten': {
+      if (!hasAlphaBands(img)) return img
+      const rgb = parseColor(step.background ?? '#ffffff')
+      return img.flatten({ background: backgroundFor(img.bands, rgb) })
+    }
+
     default:
-      throw new EngineError(`未知操作 "${op}"，可选：autorot / resize / crop / rotate / flip / flop`, 'BAD_OP')
+      throw new EngineError(
+        `未知操作 "${op}"，可选：autorot / resize / crop / rotate / flip / flop / flatten`,
+        'BAD_OP',
+      )
   }
 }
 
@@ -299,18 +370,20 @@ function thumbnailArgs(step, autorotate) {
 /**
  * 执行完整管线。
  *
- * @param {object} vips    已初始化的 wasm-vips 模块
+ * @param {object} vips      已初始化的 wasm-vips 模块
  * @param {Uint8Array} input 源图片字节
- * @param {Array} ops      操作列表，按顺序执行
- * @param {object} output  输出选项（format / quality / ...）
- * @returns {{buffer: Uint8Array, width: number, height: number, format: string, mime: string}}
+ * @param {Array} ops        操作列表，按顺序执行
+ * @param {object} output    输出选项（format / quality / targetSize / animated / background / flatten / ...）
+ * @param {object} [control] 运行时挂钩：onProgress(percent)，在**当前线程**内同步回调
+ * @returns {{buffer: Uint8Array, width: number, height: number, frameHeight: number,
+ *            frames: number, quality: number|null|undefined, format: string, mime: string}}
  */
-export function runPipeline(vips, input, ops = [], output = {}) {
+export function runPipeline(vips, input, ops = [], output = {}, control = {}) {
   const steps = Array.isArray(ops) ? ops : ops ? [ops] : []
 
   const sourceFormat = sniffFormat(input)
   const requested = normalizeFormat(output.format)
-  let format = requested || sourceFormat || 'jpeg'
+  const format = requested || sourceFormat || 'jpeg'
   if (!SUFFIX_BY_FORMAT[format]) {
     if (format === 'heic' || format === 'heif') {
       throw new EngineError(
@@ -324,10 +397,50 @@ export function runPipeline(vips, input, ops = [], output = {}) {
     )
   }
 
-  // EXIF 摆正：默认开启，可用 output.autorotate = false 关闭
+  const suffix = SUFFIX_BY_FORMAT[format]
   const autorotate = output.autorotate !== false
-  // 调用方显式写了 autorot 步骤则不再重复插入
   const userHasAutorot = steps.some((s) => (s?.op || s?.operation) === 'autorot')
+
+  /* ── 目标体积 ─────────────────────────────────────────────── */
+  const targetBytes = parseByteSize(output.targetSize)
+  const nativeTarget = targetBytes > 0 && format === 'webp' && output.lossless !== true
+  const bisectTarget = targetBytes > 0 && !nativeTarget && BISECT_FORMATS.has(format)
+  if (targetBytes > 0 && !nativeTarget && !bisectTarget) {
+    throw new EngineError(
+      `targetSize 不支持 ${format}：无损格式无法按体积收敛。目前只对 webp / jpeg / avif / jxl 生效。`,
+      'UNSUPPORTED_OPTION',
+    )
+  }
+
+  /* ── 动图 ─────────────────────────────────────────────────── */
+  const animated = output.animated === true
+  if (animated) {
+    if (!ANIMATED_FORMATS.has(format)) {
+      throw new EngineError(
+        `animated: true 只支持 gif / webp / avif 输出，当前是 ${format}`,
+        'UNSUPPORTED_OPTION',
+      )
+    }
+    const unsupported = steps.find((s) => {
+      const op = s?.op || s?.operation
+      return op && op !== 'resize' && op !== 'autorot' && op !== 'flatten'
+    })
+    if (unsupported) {
+      throw new EngineError(
+        `animated: true 时只允许 resize（可附带 autorot / flatten）——当前还带了 `
+        + `"${unsupported.op || unsupported.operation}"，裁剪 / 旋转会破坏多帧结构。`
+        + '只处理单帧请显式传 animated: false。',
+        'UNSUPPORTED_OPTION',
+      )
+    }
+  }
+
+  /* ── 透明合成 ─────────────────────────────────────────────── */
+  // 目标格式不含 alpha（目前只有 jpeg）时必须先合成到背景色，
+  // 否则 libvips 会按黑底合成 —— 透明 logo 转 JPEG 会得到黑底图。
+  const autoFlatten = FORMATS_WITHOUT_ALPHA.has(format) && output.flatten !== false
+  const explicitFlatten = steps.some((s) => (s?.op || s?.operation) === 'flatten')
+  const background = parseColor(output.background ?? '#ffffff')
 
   const created = []
   const track = (im) => { created.push(im); return im }
@@ -336,17 +449,21 @@ export function runPipeline(vips, input, ops = [], output = {}) {
     let img = null
     let rest = steps
 
+    // 快速路径：首个操作就是 resize 时交给 libvips thumbnail，
+    // 它在解码阶段就按目标尺寸采样（JPEG 尤其明显），比先全量解码再缩放快得多。
     const first = steps[0]
     if (first && (first.op || first.operation) === 'resize') {
       const fast = thumbnailArgs(first, autorotate)
       if (fast) {
+        if (animated) fast.options.option_string = 'n=-1' // 多帧：让底层 loader 载入全部帧
         img = track(vips.Image.thumbnailBuffer(input, fast.width, fast.options))
         rest = steps.slice(1)
       }
     }
 
     if (!img) {
-      img = track(vips.Image.newFromBuffer(input))
+      // 'n=-1' 是 loader 的选项串：多帧格式（gif / webp / avif）由此载入全部帧
+      img = track(animated ? vips.Image.newFromBuffer(input, 'n=-1') : vips.Image.newFromBuffer(input))
       if (autorotate && !userHasAutorot) img = track(img.autorot())
     }
 
@@ -356,14 +473,79 @@ export function runPipeline(vips, input, ops = [], output = {}) {
       if (next && next !== img) img = track(next)
     }
 
+    if (autoFlatten && !explicitFlatten && hasAlphaBands(img)) {
+      img = track(img.flatten({ background: backgroundFor(img.bands, background) }))
+    }
+
     const width = img.width
     const height = img.height
-    const raw = img.writeToBuffer(SUFFIX_BY_FORMAT[format], buildSaveOptions(format, output))
+    let frameHeight = height
+    try { if (img.pageHeight > 0) frameHeight = img.pageHeight } catch { /* 无 page-height 视为单帧 */ }
+    const frames = frameHeight > 0 ? Math.max(1, Math.round(height / frameHeight)) : 1
+
+    // 进度：libvips 在求值过程中回调本函数，这里折成 0-100 的整数变化再上报
+    if (typeof control.onProgress === 'function') {
+      const report = control.onProgress
+      let last = -1
+      img.onProgress = (percent) => {
+        const p = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))
+        if (p === last) return
+        last = p
+        try { report(p) } catch { /* 调用方回调抛错不应影响处理 */ }
+      }
+    }
+
+    const withPage = (o) => {
+      if (animated && frameHeight > 0) o.page_height = frameHeight
+      return o
+    }
+
+    let quality = output.quality
+    let raw
+    if (bisectTarget) {
+      // 二分 quality 逼近目标体积。只记下命中的 quality、最后重编一次，
+      // 避免在多次编码之间持有 WASM 堆上的视图（内存会被复用）。
+      let lo = 1
+      let hi = 100
+      let best = 0
+      for (let i = 0; i < 7 && lo <= hi; i++) {
+        const q = Math.round((lo + hi) / 2)
+        const size = img.writeToBuffer(
+          suffix,
+          withPage(buildSaveOptions(format, { ...output, targetSize: undefined, quality: q })),
+        ).byteLength
+        if (size <= targetBytes) {
+          best = q
+          lo = q + 1
+          if (size >= targetBytes * 0.92) break // 已经贴着目标，收手
+        } else {
+          hi = q - 1
+        }
+      }
+      quality = best > 0 ? best : 1
+      raw = img.writeToBuffer(
+        suffix,
+        withPage(buildSaveOptions(format, { ...output, targetSize: undefined, quality })),
+      )
+    } else {
+      if (nativeTarget) quality = null // libwebp 自己决定，Q 被忽略
+      raw = img.writeToBuffer(suffix, withPage(buildSaveOptions(format, output)))
+    }
+
     // 立刻复制成独立内存：raw 可能是 WASM 堆上的视图，
     // 一旦下面的 finally 释放了图像，堆内存就会被复用。
     const buffer = raw.slice()
 
-    return { buffer, width, height, format, mime: MIME_BY_FORMAT[format] }
+    return {
+      buffer,
+      width,
+      height,
+      frameHeight,
+      frames,
+      quality,
+      format,
+      mime: MIME_BY_FORMAT[format],
+    }
   } finally {
     for (const im of created) {
       try { if (im && !im.isDeleted?.()) im.delete?.() } catch { /* 忽略释放期异常 */ }
@@ -373,22 +555,35 @@ export function runPipeline(vips, input, ops = [], output = {}) {
 
 /**
  * 只读取元信息，不做任何像素计算（vips 懒执行，读 header 极快）。
+ * 用 'n=-1' 载入全部帧，否则多帧格式（gif / webp / avif）只能看到第一帧，
+ * pages 会恒为 1。loader 只解析帧头、不解码像素，代价可控。
  */
 export function readMetadata(vips, input) {
-  const img = vips.Image.newFromBuffer(input)
+  let img
+  try {
+    img = vips.Image.newFromBuffer(input, 'n=-1')
+  } catch {
+    img = vips.Image.newFromBuffer(input)
+  }
   try {
     let pages = 1
+    let frameHeight = img.height
     try {
-      if (img.pageHeight > 0) pages = Math.max(1, Math.round(img.height / img.pageHeight))
+      if (img.pageHeight > 0) {
+        frameHeight = img.pageHeight
+        pages = Math.max(1, Math.round(img.height / frameHeight))
+      }
     } catch { /* 部分格式没有 page-height，忽略 */ }
     return {
       width: img.width,
       height: img.height,
+      frameHeight,
       bands: img.bands,
       hasAlpha: img.hasAlpha(),
       pixelFormat: img.format,
       interpretation: img.interpretation,
       pages,
+      animated: pages > 1,
       sourceFormat: sniffFormat(input),
     }
   } finally {

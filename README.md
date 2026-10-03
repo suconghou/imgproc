@@ -130,7 +130,7 @@ const engine = await createImageEngine(options?)
 
 ## 3. 处理图片
 
-### `engine.process(source, ops?, output?)`
+### `engine.process(source, ops?, output?, control?)`
 
 最完整的形式。`source` 支持 `File` / `Blob` / `ArrayBuffer` / `Uint8Array`。
 
@@ -143,6 +143,8 @@ const out = await engine.process(file, [
 ], {
   format: 'webp',
   quality: 82,
+}, {
+  signal,            // 可选：AbortSignal，用于中途取消
 })
 ```
 
@@ -153,15 +155,19 @@ const out = await engine.process(file, [
 
 | 方法 | 等价于 |
 |---|---|
-| `engine.resize(source, opts)` | `process(source, [{ op:'resize', ...opts }], opts.output)` |
-| `engine.crop(source, opts)` | `process(source, [{ op:'crop', ...opts }], opts.output)` |
-| `engine.convert(source, output?)` | `process(source, [], output)` |
+| `engine.resize(source, { ...opts, output, control })` | `process(source, [{ op:'resize', ...opts }], output, control)` |
+| `engine.crop(source, { ...opts, output, control })` | `process(source, [{ op:'crop', ...opts }], output, control)` |
+| `engine.convert(source, output?, control?)` | `process(source, [], output, control)` |
 | `engine.metadata(source)` | 只读元信息，不解码像素 |
 
 ```js
 const meta = await engine.metadata(file)
-// { width, height, bands, hasAlpha, pixelFormat, interpretation, pages, sourceFormat }
+// { width, height, frameHeight, bands, hasAlpha, pixelFormat, interpretation,
+//   pages, animated, sourceFormat }
 ```
+
+> 元信息会用 `n=-1` 载入全部帧，所以 `pages` / `animated` 对 GIF / WebP 动图是准确的 ——
+> 代价是 loader 要解析所有帧头（只读帧头，不解码像素）。
 
 ### 操作（ops）
 
@@ -175,6 +181,7 @@ const meta = await engine.metadata(file)
 | `rotate` | `angle` | 仅 `0` / `90` / `180` / `270` |
 | `flip` | — | 上下翻转 |
 | `flop` | — | 左右翻转 |
+| `flatten` | `background` | 把透明区合成到背景色并去掉 alpha；图像本来没有 alpha 则原样返回 |
 
 **`resize.fit` 取值**
 
@@ -192,6 +199,8 @@ const meta = await engine.metadata(file)
 |---|---|---|
 | `format` | 全部 | `jpeg` `png` `webp` `avif` `gif` `tiff` `jxl`；省略则保持源格式 |
 | `quality` | jpeg/webp/avif/jxl | 1-100。默认：jpeg 85、webp 80、avif 60、jxl 80 |
+| `targetSize` | webp/jpeg/avif/jxl | 目标体积，见下文 |
+| `passes` | webp | 走 `targetSize` 时的编码遍数，默认 6 |
 | `progressive` | jpeg/png/gif | 渐进式 / 交错 |
 | `lossless` | webp/avif/jxl/tiff | 无损模式 |
 | `effort` | webp/avif/jxl/gif | 编码投入度，越高越小越慢。默认 webp 4、avif 4、jxl 5、gif 7 |
@@ -200,6 +209,10 @@ const meta = await engine.metadata(file)
 | `chromaSubsampling` | jpeg | `auto` / `on` / `off` / `q4` |
 | `keepMetadata` | 全部 | `true` 保留 EXIF/ICC 等；默认 `false`，剥掉更小 |
 | `autorotate` | 全部 | `false` 关闭默认的 EXIF 摆正 |
+| `background` | 全部 | 透明区合成用的背景色，默认 `'#ffffff'` |
+| `flatten` | 全部 | `false` 可关闭「目标格式无 alpha 时自动合成背景」 |
+| `animated` | gif/webp/avif | `true` 保留动图多帧，默认 `false`（只取第一帧） |
+| `onProgress` | 全部 | 进度回调 `(percent) => void`，见下文 |
 | `options` | 全部 | 逃生舱：直接透传任意 libvips 保存选项 |
 
 ```js
@@ -207,18 +220,90 @@ const meta = await engine.metadata(file)
 await engine.convert(file, { format: 'jpeg', options: { trellis_quant: true, optimize_scans: true } })
 ```
 
+### 透明图与背景色
+
+目标格式不含 alpha（目前只有 `jpeg`）时，引擎**会自动把透明区合成到背景色**，
+默认白色。不做这一步的话 libvips 会按黑底合成 —— 透明 logo 转 JPEG 会得到黑底图。
+
+```js
+await engine.convert(transparentPng, { format: 'jpeg' })                    // 白底（默认）
+await engine.convert(transparentPng, { format: 'jpeg', background: '#1a1a1a' })
+await engine.process(transparentPng, [{ op: 'flatten', background: 'white' }], { format: 'png' })
+await engine.convert(transparentPng, { format: 'jpeg', flatten: false })    // 退回旧行为（黑底）
+```
+
+`background` 接受 `'#rgb'` / `'#rrggbb'` / `'white'` / `'black'` / `[r, g, b]`。
+
+### 按目标体积压缩
+
+```js
+await engine.convert(file, { format: 'webp', targetSize: '200kb' })  // 数字（字节）或 '200kb' / '1.5mb'
+```
+
+- **webp**：走 libwebp 原生的 `target_size`，一次编码就精确命中，此时 `quality` 被忽略
+  （返回值里 `quality` 为 `null`）。
+- **jpeg / avif / jxl**：引擎内部二分 `quality` 逼近（最多 7 轮），
+  所以是「多编码几次换精确」，比纯 `quality` 模式慢。返回值里 `quality` 是最终选中的值。
+- **png / gif / tiff**：无损格式无法按体积收敛，会抛 `UNSUPPORTED_OPTION`。
+
+### 动图（GIF / WebP / AVIF）
+
+默认只取第一帧。要保留动图传 `animated: true`：
+
+```js
+const out = await engine.process(animatedGif, [{ op: 'resize', width: 480 }], {
+  format: 'webp', quality: 80, animated: true,
+})
+out.frames       // 2 —— 保留了几帧
+out.frameHeight  // 单帧高度（out.height 是所有帧拼起来的总高度）
+```
+
+限制（不满足会抛 `UNSUPPORTED_OPTION`，不会悄悄出半成品）：
+
+- 输出格式只支持 `gif` / `webp` / `avif`
+- 只允许 `resize`（可附带 `autorot` / `flatten`）；`crop` / `rotate` 会破坏多帧结构
+- 会载入全部帧，内存与耗时随帧数上升
+
+### 进度与取消
+
+```js
+const ac = new AbortController()
+
+const out = await engine.process(file, [{ op: 'resize', width: 2000 }], {
+  format: 'avif',
+  effort: 6,
+  onProgress: (percent) => setProgress(percent),   // 0-100，在主线程被调用
+}, {
+  signal: ac.signal,
+})
+
+cancelButton.onclick = () => ac.abort()   // 会以 code = 'ABORTED' 拒绝
+```
+
+`onProgress` 是函数、不能跨线程传递，引擎会把它留在主线程、按任务 id 路由 Worker 的进度消息，
+所以**调用方无需关心引擎跑在 Worker 还是主线程**。
+
+取消的实现方式：Worker 里是同步的 WASM 求值，发消息进去不会被处理，
+所以引擎会**终止该 Worker 并用新 Worker 补位**。这意味着取消后的第一次调用需要等新 Worker
+把 wasm 重新初始化（约 1–3s，wasm 本身有 HTTP 缓存）。直连模式（Node / 无 Worker）
+下处理是同步的，`signal` 只在开始前生效。
+
 ### 返回值
 
 ```js
 {
-  buffer,   // Uint8Array，输出字节
-  blob,     // Blob（浏览器），Node 下为 null
-  width,    // 输出宽
-  height,   // 输出高
-  size,     // 字节数
-  format,   // 'webp'
-  mime,     // 'image/webp'
-  type,     // mime 的别名
+  buffer,       // Uint8Array，输出字节
+  blob,         // Blob（浏览器），Node 下为 null
+  width,        // 输出宽
+  height,       // 输出高；多帧时是所有帧拼起来的总高度
+  frameHeight,  // 单帧高度
+  frames,       // 帧数，> 1 表示动图
+  animated,     // frames > 1
+  quality,      // 实际使用的 quality；webp 走 targetSize 时为 null，未指定时为 undefined
+  size,         // 字节数
+  format,       // 'webp'
+  mime,         // 'image/webp'
+  type,         // mime 的别名
 }
 ```
 
@@ -252,6 +337,8 @@ try {
 | `BAD_OP` | 操作不合法（未知 op、旋转角度不是 90 的倍数） |
 | `OUT_OF_BOUNDS` | 裁剪区域超出图像边界 |
 | `UNSUPPORTED_FORMAT` | 目标格式不支持（含试图输出 HEIC 的情况） |
+| `UNSUPPORTED_OPTION` | 选项组合不成立：无损格式要 `targetSize`、`animated` 配了裁剪、`animated` 输出到 jpeg 等 |
+| `ABORTED` | 被 `AbortSignal` 取消 |
 | `WORKER_ERROR` | Worker 内部崩溃 |
 | `NOT_CROSS_ORIGIN_ISOLATED` | 缺少 COOP/COEP 响应头（见第 6 节） |
 | `DESTROYED` | 引擎已 `destroy()` 后继续调用 |
@@ -267,11 +354,15 @@ try {
 | PNG | ✅ | ✅ | 无损；`palette: true` 可转调色板 |
 | WebP | ✅ | ✅ | 支持无损 |
 | AVIF | ✅ | ✅ | 走 `vips-heif.wasm` 动态模块 |
-| GIF | ✅ | ✅ | 多帧图默认只取第一帧 |
+| GIF | ✅ | ✅ | 动图见下（`animated: true`） |
 | TIFF | ✅ | ✅ | |
 | JPEG XL | ✅ | ✅ | 走 `vips-jxl.wasm` 动态模块 |
 | SVG | ⚠️ 需 `svg: true` | ❌ | 需 `vips-resvg.wasm` |
 | **HEIC / HEIF（HEVC）** | ❌ | ❌ | 见下 |
+
+**关于动图**：GIF / WebP / AVIF 的多帧图**默认只取第一帧**（这样最省内存）。
+要保留动图传 `animated: true`，输出格式限 `gif` / `webp` / `avif`，且只允许 `resize`
+—— 详见第 3 节「动图」。
 
 **关于 HEIC**：HEIC 用 HEVC 编码，HEVC 有专利授权问题，WASM 包不带 HEVC 解码器/编码器，
 这是整个行业的做法（Chromium、WordPress 的客户端图像处理都是这么绕开的）。

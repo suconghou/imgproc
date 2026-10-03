@@ -129,6 +129,53 @@ try {
   catch (err) { code = err.code }
   push('越界裁剪抛 OUT_OF_BOUNDS', code === 'OUT_OF_BOUNDS', code)
 
+  // 造一张大且带噪点的 PNG：用来产生足够长的编码时间，才能观察到进度与中断
+  mark('make-big')
+  async function makeBigFile(w, h) {
+    const canvas = new OffscreenCanvas(w, h)
+    const ctx = canvas.getContext('2d')
+    const d = ctx.createImageData(w, h)
+    for (let i = 0; i < d.data.length; i += 4) {
+      const p = i >> 2
+      d.data[i] = (p * 7 + (p >> 9) * 13) & 255
+      d.data[i + 1] = (p * 3 + (p >> 7) * 29) & 255
+      d.data[i + 2] = (p * 11 + (p >> 11) * 5) & 255
+      d.data[i + 3] = 255
+    }
+    ctx.putImageData(d, 0, 0)
+    const blob = await canvas.convertToBlob({ type: 'image/png' })
+    return new File([blob], 'big.png', { type: 'image/png' })
+  }
+  const bigFile = await makeBigFile(1600, 1600)
+  const hugeFile = await makeBigFile(2600, 2600)
+
+  mark('progress')
+  const pcts = []
+  const bigOut = await engine.process(bigFile, [{ op: 'resize', width: 1200 }], {
+    format: 'avif', quality: 60, effort: 5,
+    onProgress: (p) => pcts.push(p),
+  })
+  push('进度回调跨 Worker 可用', pcts.length > 0, '收到 ' + pcts.length + ' 次')
+  push('进度值在 0-100 且以 100 收尾',
+    pcts.every((p) => p >= 0 && p <= 100) && pcts[pcts.length - 1] === 100,
+    JSON.stringify(pcts.slice(-5)))
+  push('大图处理成功', bigOut.size > 0 && bigOut.format === 'avif', bigOut.size + ' B')
+
+  mark('cancel')
+  const ac = new AbortController()
+  const started = performance.now()
+  const task = engine.process(hugeFile, [], { format: 'avif', quality: 80, effort: 9 }, { signal: ac.signal })
+  setTimeout(() => ac.abort(), 300)
+  let cancelCode = ''
+  try { await task } catch (err) { cancelCode = err.code }
+  const elapsed = Math.round(performance.now() - started)
+  push('abort 能中断进行中的任务', cancelCode === 'ABORTED', cancelCode + ' / ' + elapsed + 'ms')
+
+  // 取消会终止并回收该 Worker，这里验证引擎随后仍可正常工作
+  const after = await engine.convert(file, { format: 'webp', quality: 70 })
+  push('取消后引擎仍可用（Worker 已补位）',
+    after.size > 0 && after.format === 'webp', after.size + ' B')
+
   mark('destroy')
   engine.destroy()
   push('destroy 后再次处理被拒', await (async () => {
